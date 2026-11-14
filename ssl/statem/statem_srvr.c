@@ -2585,6 +2585,29 @@ static int tls_early_post_process_client_hello(SSL_CONNECTION *s)
             goto err;
         }
         OSSL_TRACE_END(TLS_CIPHER);
+
+        /*
+         * The check above only proves the client still offers the session's
+         * ciphersuite. A resumed session reuses s->session->cipher directly
+         * (see tls_post_process_client_hello()) and never passes through
+         * ssl3_choose_cipher(), so it would bypass any policy change made
+         * after the original full handshake. Re-apply the same two gates the
+         * normal selection path enforces: the ciphersuite must still be
+         * enabled in *this* server's current configuration, and the security
+         * callback / security level must still permit it.
+         */
+        if (sk_SSL_CIPHER_find(ssl_get_ciphers_by_id(s),
+                               s->session->cipher) < 0) {
+            SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER,
+                SSL_R_REQUIRED_CIPHER_MISSING);
+            goto err;
+        }
+        if (!ssl_security(s, SSL_SECOP_CIPHER_SHARED,
+                          s->session->cipher->strength_bits, 0,
+                          (void *)s->session->cipher)) {
+            SSLfatal(s, SSL_AD_HANDSHAKE_FAILURE, SSL_R_NO_SHARED_CIPHER);
+            goto err;
+        }
     }
 
     /* At least one compression method must be preset. */

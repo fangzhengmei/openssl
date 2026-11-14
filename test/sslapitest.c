@@ -2124,6 +2124,80 @@ end:
 
     return testresult;
 }
+
+/*
+ * A resumed TLSv1.2 session reuses the session's ciphersuite directly and
+ * never passes through ssl3_choose_cipher(). It must therefore independently
+ * re-apply the two gates the normal selection path enforces: the ciphersuite
+ * must still be enabled in the server's *current* cipher configuration, and
+ * the security callback/level must still permit it. Otherwise a ciphersuite
+ * disabled (or demoted by a security-level change) after the original full
+ * handshake would silently come back on resumption.
+ */
+static int test_resumption_honours_disabled_cipher(void)
+{
+    SSL_CTX *cctx = NULL, *sctx = NULL;
+    SSL *clientssl = NULL, *serverssl = NULL;
+    SSL_SESSION *sess = NULL;
+    int testresult = 0;
+
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+            TLS_client_method(), TLS1_2_VERSION, TLS1_2_VERSION,
+            &sctx, &cctx, cert, privkey)))
+        return 0;
+
+    if (!TEST_true(SSL_CTX_set_options(sctx, SSL_OP_NO_TICKET)))
+        goto end;
+
+    /* Full handshake on the target ciphersuite and capture the session. */
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_CTX_set_cipher_list(sctx, "ECDHE-RSA-AES128-GCM-SHA256"))
+        || !TEST_true(SSL_CTX_set_cipher_list(cctx, "ECDHE-RSA-AES128-GCM-SHA256"))
+        || !TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE))
+        || !TEST_ptr(sess = SSL_get1_session(clientssl)))
+        goto end;
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+
+    /* Sanity: resumption works while the ciphersuite stays enabled. */
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_set_session(clientssl, sess))
+        || !TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE))
+        || !TEST_true(SSL_session_reused(clientssl))
+        || !TEST_true(SSL_session_reused(serverssl)))
+        goto end;
+    shutdown_ssl_connection(serverssl, clientssl);
+    serverssl = clientssl = NULL;
+
+    /*
+     * Tighten the server policy after the session was issued: drop the
+     * resumed ciphersuite from the server's current list. The client still
+     * offers it and carries the old session, so resumption must be refused
+     * rather than resurrecting the now-disabled ciphersuite.
+     */
+    if (!TEST_true(SSL_CTX_set_cipher_list(sctx,
+            "DEFAULT:!ECDHE-RSA-AES128-GCM-SHA256"))
+        || !TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_set_session(clientssl, sess))
+        || !TEST_false(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE)))
+        goto end;
+
+    testresult = 1;
+end:
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    SSL_SESSION_free(sess);
+
+    return testresult;
+}
 #endif
 
 static int execute_test_large_message(const SSL_METHOD *smeth,
@@ -19718,6 +19792,9 @@ int setup_tests(void)
     ADD_TEST(test_session_with_both_cache);
     ADD_TEST(test_remove_session_cb_not_under_lock);
     ADD_TEST(test_session_wo_ca_names);
+#ifndef OPENSSL_NO_TLS1_2
+    ADD_TEST(test_resumption_honours_disabled_cipher);
+#endif
 #if !defined(OSSL_NO_USABLE_TLS1_3) || !defined(OSSL_NO_USABLE_DTLS1_3)
     ADD_ALL_TESTS(test_stateful_tickets, 6);
     ADD_ALL_TESTS(test_stateless_tickets, 6);
