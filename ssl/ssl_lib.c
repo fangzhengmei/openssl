@@ -614,6 +614,7 @@ int ossl_ssl_connection_reset(SSL *s)
     sc->hello_retry_request = SSL_HRR_NONE;
     sc->dtls13_process_hello = 0;
     sc->sent_tickets = 0;
+    sc->ext.hrr_ch_hash_set = 0;
 
     sc->error = 0;
     sc->hit = 0;

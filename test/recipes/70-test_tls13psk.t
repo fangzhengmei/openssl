@@ -268,10 +268,15 @@ sub remove_sig_algs_filter
     my $proxy = shift;
     my $message;
 
-    # Only look at the first ClientHello
-    return if $proxy->flight != 0;
+    # Only look at ClientHello flights (the initial one and any retry)
+    return if $proxy->flight != 0 && $proxy->flight != 2;
 
-    $message = ${$proxy->message_list}[0];
+    # Find the most recent ClientHello
+    foreach my $msg (@{$proxy->message_list}) {
+        $message = $msg
+            if $msg->{mt} == TLSProxy::Message::MT_CLIENT_HELLO;
+    }
+    return if !defined $message;
     $message->delete_extension(TLSProxy::Message::EXT_SIG_ALGS);
     $message->repack();
 }

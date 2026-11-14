@@ -17,7 +17,7 @@
 #include <openssl/trace.h>
 #endif
 
-#define COOKIE_STATE_FORMAT_VERSION 1
+#define COOKIE_STATE_FORMAT_VERSION 2
 
 #define MAX_SUPPORTED_GROUPS 128
 #define MAX_KEY_SHARES 16
@@ -27,11 +27,13 @@
  * 2 bytes for packet length, 2 bytes for format version, 2 bytes for
  * protocol version, 2 bytes for group id, 2 bytes for cipher id, 1 byte for
  * key_share present flag, 8 bytes for timestamp, 2 bytes for the hashlen,
- * EVP_MAX_MD_SIZE for transcript hash, 1 byte for app cookie length, app cookie
- * length bytes, SHA256_DIGEST_LENGTH bytes for the HMAC of the whole thing.
+ * EVP_MAX_MD_SIZE for transcript hash, SHA256_DIGEST_LENGTH bytes for the
+ * first ClientHello consistency digest, 1 byte for app cookie length,
+ * app cookie length bytes, SHA256_DIGEST_LENGTH bytes for the HMAC of the
+ * whole thing.
  */
 #define MAX_COOKIE_SIZE (2 + 2 + 2 + 2 + 2 + 1 + 8 + 2 + EVP_MAX_MD_SIZE + 1 \
-    + SSL_COOKIE_LENGTH + SHA256_DIGEST_LENGTH)
+    + SHA256_DIGEST_LENGTH + SSL_COOKIE_LENGTH + SHA256_DIGEST_LENGTH)
 
 /*
  * Message header + 2 bytes for protocol version + number of random bytes +
@@ -995,7 +997,7 @@ int tls_parse_ctos_cookie(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
     EVP_PKEY *pkey;
     PACKET cookie, raw, chhash, appcookie;
     WPACKET hrrpkt;
-    const unsigned char *data, *mdin, *ciphdata;
+    const unsigned char *data, *mdin, *ciphdata, *chconsistency;
     unsigned char hmac[SHA256_DIGEST_LENGTH];
     unsigned char hrr[MAX_HRR_SIZE];
     size_t rawlen, hmaclen, hrrlen, ciphlen;
@@ -1120,6 +1122,7 @@ int tls_parse_ctos_cookie(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
     if (!PACKET_get_1(&cookie, &key_share)
         || !PACKET_get_net_8(&cookie, &tm)
         || !PACKET_get_length_prefixed_2(&cookie, &chhash)
+        || !PACKET_get_bytes(&cookie, &chconsistency, SHA256_DIGEST_LENGTH)
         || !PACKET_get_length_prefixed_1(&cookie, &appcookie)
         || PACKET_remaining(&cookie) != SHA256_DIGEST_LENGTH) {
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_LENGTH_MISMATCH);
@@ -1233,6 +1236,21 @@ int tls_parse_ctos_cookie(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
     /* The key_share parsing then checks the client sent the group we asked for */
     if (key_share)
         s->s3.group_id = group_id;
+
+    /*
+     * Recover the digest of the consistency-critical parts of the first
+     * ClientHello so that the retried ClientHello can be checked against it
+     * in the same way as for the stateful HelloRetryRequest path. An
+     * all-zero digest means none was recorded (e.g. ECH was attempted).
+     */
+    {
+        static const unsigned char zeros[SHA256_DIGEST_LENGTH] = { 0 };
+
+        if (CRYPTO_memcmp(chconsistency, zeros, SHA256_DIGEST_LENGTH) != 0) {
+            memcpy(s->ext.hrr_ch_hash, chconsistency, SHA256_DIGEST_LENGTH);
+            s->ext.hrr_ch_hash_set = true;
+        }
+    }
 
     s->ext.cookieok = 1;
 #endif
@@ -2200,6 +2218,7 @@ EXT_RETURN tls_construct_stoc_cookie(SSL_CONNECTION *s, WPACKET *pkt,
     X509 *x, size_t chainidx)
 {
 #if !(defined(OPENSSL_NO_TLS1_3) && defined(OPENSSL_NO_DTLS1_3))
+    static const unsigned char zeros[SHA256_DIGEST_LENGTH] = { 0 };
     unsigned char *hashval1, *hashval2, *appcookie1, *appcookie2, *cookie;
     unsigned char *hmac, *hmac2;
     size_t startlen, ciphlen, totcookielen, hashlen, hmaclen;
@@ -2264,6 +2283,16 @@ EXT_RETURN tls_construct_stoc_cookie(SSL_CONNECTION *s, WPACKET *pkt,
     if (!WPACKET_allocate_bytes(pkt, hashlen, &hashval2)
         || !ossl_assert(hashval1 == hashval2)
         || !WPACKET_close(pkt)
+        /*
+         * Add the digest of the consistency-critical parts of the first
+         * ClientHello, if one was recorded when the decision to send a
+         * HelloRetryRequest was made (it is not recorded when ECH was
+         * attempted, as ECH has its own consistency mechanisms). All-zero
+         * means "no digest".
+         */
+        || !WPACKET_memcpy(pkt,
+            s->ext.hrr_ch_hash_set ? s->ext.hrr_ch_hash : zeros,
+            SHA256_DIGEST_LENGTH)
         || !WPACKET_start_sub_packet_u8(pkt)
         || !WPACKET_reserve_bytes(pkt, SSL_COOKIE_LENGTH, &appcookie1)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);

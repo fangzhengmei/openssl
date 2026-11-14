@@ -9,9 +9,16 @@
  * https://www.openssl.org/source/license.html
  */
 
+/*
+ * The SHA256 low level API is deprecated for public use, but still ok for
+ * internal use (see tls13_clienthello_consistency_hash()).
+ */
+#include "internal/deprecated.h"
+
 #include "internal/e_os.h"
 
 #include <stdio.h>
+#include <openssl/sha.h>
 #include "../ssl_local.h"
 #include "statem_local.h"
 #include "internal/constant_time.h"
@@ -2289,12 +2296,89 @@ err:
     return MSG_PROCESS_ERROR;
 }
 
+/*
+ * Compute a digest over the parts of a ClientHello that RFC 8446 section
+ * 4.1.2 requires to remain unchanged between the first ClientHello and the
+ * one sent in response to a HelloRetryRequest. Only a small number of
+ * extensions (e.g. key_share and cookie) are permitted to change in the
+ * retried ClientHello. We cover the legacy version together with the
+ * server_name, ALPN, signature algorithms and supported_versions
+ * extensions, since changing any of those would allow the retry to escape
+ * the constraints negotiated from the first ClientHello.
+ *
+ * The low-level SHA256 API is used deliberately: the digest must not be
+ * affected by provider-supplied implementations selected via the SSL_CTX
+ * property query, and it is only ever compared within this library.
+ */
+static int tls13_clienthello_consistency_hash(SSL_CONNECTION *s,
+    unsigned char *md,
+    size_t *mdlen)
+{
+    static const int consistency_exts[] = {
+        TLSEXT_IDX_server_name,
+        TLSEXT_IDX_application_layer_protocol_negotiation,
+        TLSEXT_IDX_signature_algorithms,
+        TLSEXT_IDX_signature_algorithms_cert,
+        TLSEXT_IDX_supported_versions
+    };
+    CLIENTHELLO_MSG *clienthello = s->clienthello;
+    SHA256_CTX ctx;
+    unsigned char hdr[4];
+    size_t i;
+
+    *mdlen = 0;
+    if (clienthello == NULL || clienthello->pre_proc_exts == NULL) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+
+    if (SHA256_Init(&ctx) <= 0) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_EVP_LIB);
+        return 0;
+    }
+
+    hdr[0] = (unsigned char)((clienthello->legacy_version >> 8) & 0xff);
+    hdr[1] = (unsigned char)(clienthello->legacy_version & 0xff);
+    if (SHA256_Update(&ctx, hdr, 2) <= 0)
+        goto err;
+
+    for (i = 0; i < OSSL_NELEM(consistency_exts); i++) {
+        RAW_EXTENSION *ext = &clienthello->pre_proc_exts[consistency_exts[i]];
+        size_t extlen;
+
+        if (!ext->present)
+            continue;
+        extlen = PACKET_remaining(&ext->data);
+        hdr[0] = (unsigned char)((ext->type >> 8) & 0xff);
+        hdr[1] = (unsigned char)(ext->type & 0xff);
+        hdr[2] = (unsigned char)((extlen >> 8) & 0xff);
+        hdr[3] = (unsigned char)(extlen & 0xff);
+        if (SHA256_Update(&ctx, hdr, sizeof(hdr)) <= 0
+            || (extlen > 0
+                && SHA256_Update(&ctx, PACKET_data(&ext->data), extlen) <= 0))
+            goto err;
+    }
+
+    if (SHA256_Final(md, &ctx) <= 0)
+        goto err;
+
+    *mdlen = SHA256_DIGEST_LENGTH;
+    return 1;
+
+err:
+    SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_EVP_LIB);
+    return 0;
+}
+
 static int tls_early_post_process_client_hello(SSL_CONNECTION *s)
 {
     unsigned int j;
     int i, al = SSL_AD_INTERNAL_ERROR;
     int protverr;
     unsigned long id;
+    unsigned char chash[SHA256_DIGEST_LENGTH];
+    size_t chashlen = 0;
+    int chash_valid = 0;
 #ifndef OPENSSL_NO_COMP
     SSL_COMP *comp = NULL;
 #endif
@@ -2359,6 +2443,19 @@ static int tls_early_post_process_client_hello(SSL_CONNECTION *s)
 
     /* Set up the client_random */
     memcpy(s->s3.client_random, clienthello->random, SSL3_RANDOM_SIZE);
+
+    /*
+     * Compute the HelloRetryRequest consistency digest now, while the raw
+     * extensions are still intact: the extension parsers below consume the
+     * PACKETs held in clienthello->pre_proc_exts.
+     */
+    if (clienthello->pre_proc_exts != NULL) {
+        if (!tls13_clienthello_consistency_hash(s, chash, &chashlen)) {
+            /* SSLfatal() already called */
+            goto err;
+        }
+        chash_valid = 1;
+    }
 
     /* Choose the server SSL/TLS/DTLS version. */
     protverr = ssl_choose_server_version(s, clienthello, &dgrd);
@@ -2609,6 +2706,51 @@ static int tls_early_post_process_client_hello(SSL_CONNECTION *s)
             clienthello->pre_proc_exts, NULL, 0, 1)) {
         /* SSLfatal() already called */
         goto err;
+    }
+
+    /*
+     * RFC 8446 section 4.1.2: the ClientHello sent in response to a
+     * HelloRetryRequest must be identical to the original one except for a
+     * small number of permitted changes (e.g. key_share and cookie). Verify
+     * that the version, SNI, ALPN and signature algorithms were not tampered
+     * with. The stateful path and the stateless cookie path share this same
+     * check: in the latter case the digest of the first ClientHello is
+     * recovered from the HRR cookie.
+     *
+     * When ECH was attempted the first ClientHello is already bound into
+     * the transcript by the ECH mechanisms (and the second ClientHello may
+     * legitimately be processed as the outer one if ECH decryption fails),
+     * so this check does not apply.
+     */
+    if (SSL_CONNECTION_IS_VERSION13(s)
+        && s->hello_retry_request != SSL_HRR_NONE) {
+#ifndef OPENSSL_NO_ECH
+        int ech_attempted = s->ext.ech.attempted == 1;
+#else
+        int ech_attempted = 0;
+#endif
+
+        if (!chash_valid) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+            goto err;
+        }
+        if (s->ext.hrr_ch_hash_set) {
+            if (chashlen != sizeof(s->ext.hrr_ch_hash)
+                || CRYPTO_memcmp(s->ext.hrr_ch_hash, chash, chashlen) != 0) {
+                SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER,
+                    SSL_R_INCONSISTENT_CLIENT_HELLO);
+                goto err;
+            }
+        } else if (s->hello_retry_request == SSL_HRR_PENDING
+            && !ech_attempted) {
+            /*
+             * This is the first ClientHello and we are about to send a
+             * HelloRetryRequest. Remember the digest so that the retried
+             * ClientHello can be checked against it.
+             */
+            memcpy(s->ext.hrr_ch_hash, chash, chashlen);
+            s->ext.hrr_ch_hash_set = true;
+        }
     }
 
     if (!s->hit && !tls1_set_server_sigalgs(s)) {

@@ -30,7 +30,7 @@ plan skip_all => "$test_name needs elliptic curves or diffie-hellman enabled"
 
 $ENV{OPENSSL_MODULES} = abs_path(bldtop_dir("test"));
 
-my $testcount = 5;
+my $testcount = 9;
 
 plan tests => 2 * $testcount;
 
@@ -39,7 +39,11 @@ use constant {
     CHANGE_CH1_CIPHERSUITE => 1,
     DUPLICATE_HRR => 2,
     INVALID_GROUP => 3,
-    NO_SUPPORTED_VERSIONS => 4
+    NO_SUPPORTED_VERSIONS => 4,
+    CHANGE_CH2_SNI => 5,
+    CHANGE_CH2_ALPN => 6,
+    CHANGE_CH2_SIGALGS => 7,
+    CHANGE_CH2_SUPPVERSIONS => 8
 };
 
 my $fatal_alert = 0;
@@ -177,11 +181,124 @@ sub run_tests
     $testtype = NO_SUPPORTED_VERSIONS;
     $proxy->start();
     ok($fatal_alert, "supported_versions missing from HRR");
+
+    #Test 6: The server must reject with an illegal_parameter alert a second
+    #        ClientHello that changes the SNI after a HelloRetryRequest
+    $fatal_alert = 0;
+    $proxy->clear();
+    if (disabled("ec")) {
+        $proxy->serverflags("-curves ffdhe3072");
+    } else {
+        $proxy->serverflags("-curves P-256");
+    }
+    $proxy->clientflags("-servername example.com");
+    $testtype = CHANGE_CH2_SNI;
+    $proxy->start();
+    ok($fatal_alert, "SNI changes after HRR");
+
+    #Test 7: The server must reject with an illegal_parameter alert a second
+    #        ClientHello that changes the ALPN after a HelloRetryRequest
+    $fatal_alert = 0;
+    $proxy->clear();
+    if (disabled("ec")) {
+        $proxy->serverflags("-curves ffdhe3072");
+    } else {
+        $proxy->serverflags("-curves P-256");
+    }
+    $proxy->clientflags("-alpn h2");
+    $testtype = CHANGE_CH2_ALPN;
+    $proxy->start();
+    ok($fatal_alert, "ALPN changes after HRR");
+
+    #Test 8: The server must reject with an illegal_parameter alert a second
+    #        ClientHello that changes the signature algorithms after a
+    #        HelloRetryRequest
+    $fatal_alert = 0;
+    $proxy->clear();
+    if (disabled("ec")) {
+        $proxy->serverflags("-curves ffdhe3072");
+    } else {
+        $proxy->serverflags("-curves P-256");
+    }
+    $testtype = CHANGE_CH2_SIGALGS;
+    $proxy->start();
+    ok($fatal_alert, "Signature algorithms change after HRR");
+
+    #Test 9: The server must reject with an illegal_parameter alert a second
+    #        ClientHello that changes the supported_versions after a
+    #        HelloRetryRequest
+    $fatal_alert = 0;
+    $proxy->clear();
+    if (disabled("ec")) {
+        $proxy->serverflags("-curves ffdhe3072");
+    } else {
+        $proxy->serverflags("-curves P-256");
+    }
+    $testtype = CHANGE_CH2_SUPPVERSIONS;
+    $proxy->start();
+    ok($fatal_alert, "supported_versions change after HRR");
 }
 
 sub hrr_filter
 {
     my $proxy = shift;
+
+    if ($testtype == CHANGE_CH2_SNI
+        || $testtype == CHANGE_CH2_ALPN
+        || $testtype == CHANGE_CH2_SIGALGS
+        || $testtype == CHANGE_CH2_SUPPVERSIONS) {
+        # Check if we have the expected fatal alert from the server
+        if ($proxy->flight == 3) {
+            $fatal_alert = 1
+                if @{$proxy->record_list}[-1]->is_fatal_alert(1)
+                    == TLSProxy::Message::AL_DESC_ILLEGAL_PARAMETER;
+            return;
+        }
+
+        # We're only interested in the second ClientHello
+        if ($proxy->flight != 2) {
+            return;
+        }
+
+        # Find the most recent ClientHello (i.e. the retried one)
+        my $ch2;
+        foreach my $msg (@{$proxy->message_list}) {
+            $ch2 = $msg
+                if $msg->{mt} == TLSProxy::Message::MT_CLIENT_HELLO;
+        }
+        return if !defined $ch2;
+
+        my $exts = $ch2->extension_data;
+
+        if ($testtype == CHANGE_CH2_SNI) {
+            # Flip a byte in the server name
+            my $data = ${$exts}{TLSProxy::Message::EXT_SERVER_NAME};
+            substr($data, -1, 1) = substr($data, -1, 1) ^ "\x01";
+            $ch2->set_extension(TLSProxy::Message::EXT_SERVER_NAME, $data);
+        } elsif ($testtype == CHANGE_CH2_ALPN) {
+            # Flip a byte in the ALPN protocol name
+            my $data = ${$exts}{TLSProxy::Message::EXT_ALPN};
+            substr($data, -1, 1) = substr($data, -1, 1) ^ "\x01";
+            $ch2->set_extension(TLSProxy::Message::EXT_ALPN, $data);
+        } elsif ($testtype == CHANGE_CH2_SIGALGS) {
+            # Flip a byte in the signature algorithms list
+            my $data = ${$exts}{TLSProxy::Message::EXT_SIG_ALGS};
+            substr($data, -1, 1) = substr($data, -1, 1) ^ "\x01";
+            $ch2->set_extension(TLSProxy::Message::EXT_SIG_ALGS, $data);
+        } else {
+            # CHANGE_CH2_SUPPVERSIONS: drop all but the negotiated version
+            my $data = ${$exts}{TLSProxy::Message::EXT_SUPPORTED_VERSIONS};
+            if ($proxy->isdtls()) {
+                $ch2->set_extension(TLSProxy::Message::EXT_SUPPORTED_VERSIONS,
+                    pack("Cn", 2, 0xfefc));
+            } else {
+                $ch2->set_extension(TLSProxy::Message::EXT_SUPPORTED_VERSIONS,
+                    pack("Cn", 2, 0x0304));
+            }
+        }
+        $ch2->repack();
+        return;
+    }
 
     if ($testtype == CHANGE_HRR_CIPHERSUITE) {
         # We're only interested in the HRR

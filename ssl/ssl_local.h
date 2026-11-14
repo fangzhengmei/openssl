@@ -1934,6 +1934,18 @@ struct ssl_connection_st {
         /* Have we received a cookie from the client? */
         bool cookieok;
 
+        /*
+         * Digest of the consistency-critical parts of the first ClientHello
+         * (legacy_version plus the raw server_name, ALPN, signature
+         * algorithms and supported_versions extensions). Recorded when a
+         * HelloRetryRequest is sent, or recovered from the stateless HRR
+         * cookie, and checked against the second ClientHello so that a
+         * retry cannot escape the constraints negotiated originally.
+         */
+        unsigned char hrr_ch_hash[SHA256_DIGEST_LENGTH];
+        /* Set when hrr_ch_hash holds a valid first ClientHello digest */
+        bool hrr_ch_hash_set;
+
         /* indicate that we sent the extension, so we'll accept it */
         bool compress_certificate_sent;
     } ext;
