@@ -4636,6 +4636,153 @@ end:
     return testresult;
 }
 
+/*
+ * Session tickets must respect version and identity boundaries. A ticket
+ * issued at one protocol version must not be usable at another version,
+ * tickets must fail closed once the server's ticket keys have rotated, and
+ * truncated tickets must be rejected without being misparsed. In all of
+ * these cases the server must safely fall back to a full handshake at the
+ * configured version: no version downgrade and no reuse of the old session
+ * context. A valid ticket must still resume at its original version.
+ *
+ * Test 0: TLSv1.2 ticket presented to TLSv1.3-only peers
+ * Test 1: TLSv1.3 ticket presented to TLSv1.2-only peers
+ * Test 2: TLSv1.2 ticket after server ticket key rotation
+ * Test 3: TLSv1.3 ticket after server ticket key rotation
+ * Test 4: Truncated TLSv1.2 ticket
+ * Test 5: Truncated TLSv1.3 ticket
+ * Test 6: Valid TLSv1.2 ticket (must resume)
+ * Test 7: Valid TLSv1.3 ticket (must resume)
+ */
+static int test_ticket_version_boundary(int idx)
+{
+    SSL_CTX *sctx = NULL, *cctx = NULL, *sctx2 = NULL, *cctx2 = NULL;
+    SSL *serverssl = NULL, *clientssl = NULL;
+    SSL_SESSION *sess = NULL;
+    int testresult = 0;
+    int sess_id_ctx = 1;
+    int ticketver = (idx & 1) ? TLS1_3_VERSION : TLS1_2_VERSION;
+    int resumever = ticketver;
+    int expectresume = idx >= 6;
+    int rotate = idx == 2 || idx == 3;
+    int truncate = idx == 4 || idx == 5;
+
+    if (idx == 0)
+        resumever = TLS1_3_VERSION;
+    else if (idx == 1)
+        resumever = TLS1_2_VERSION;
+
+#ifdef OPENSSL_NO_TLS1_2
+    if (ticketver == TLS1_2_VERSION || resumever == TLS1_2_VERSION) {
+        testresult = TEST_skip("TLSv1.2 is disabled");
+        goto end;
+    }
+#endif
+#ifdef OSSL_NO_USABLE_TLS1_3
+    if (ticketver == TLS1_3_VERSION || resumever == TLS1_3_VERSION) {
+        testresult = TEST_skip("TLSv1.3 is not usable");
+        goto end;
+    }
+#endif
+
+    /*
+     * Issue a ticket at the original version. The server session cache is
+     * disabled so that any resumption must come from the stateless ticket
+     * and cannot be satisfied by a stateful cache lookup.
+     */
+    if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+            TLS_client_method(), ticketver, ticketver,
+            &sctx, &cctx, cert, privkey))
+        || !TEST_true(SSL_CTX_set_session_id_context(sctx,
+            (void *)&sess_id_ctx, sizeof(sess_id_ctx))))
+        goto end;
+    SSL_CTX_set_session_cache_mode(sctx, SSL_SESS_CACHE_OFF);
+
+    if (!TEST_true(create_ssl_objects(sctx, cctx, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE))
+        || !TEST_false(SSL_session_reused(clientssl))
+        || !TEST_ptr(sess = SSL_get1_session(clientssl))
+        || !TEST_true(SSL_SESSION_has_ticket(sess)))
+        goto end;
+
+    SSL_shutdown(clientssl);
+    SSL_shutdown(serverssl);
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    serverssl = clientssl = NULL;
+
+    if (truncate) {
+        /*
+         * Damage the ticket. The server must reject it cleanly rather than
+         * parse it out of bounds or resume with a corrupted context.
+         */
+        sess->ext.ticklen /= 2;
+    }
+
+    /*
+     * For the cross-version and key-rotation cases use a fresh context
+     * pair. A new server SSL_CTX has freshly generated ticket keys, which
+     * is equivalent to a key rotation: the old ticket can no longer be
+     * decrypted. Otherwise reuse the original contexts so that the ticket
+     * keys still match.
+     */
+    if (rotate || resumever != ticketver) {
+        if (!TEST_true(create_ssl_ctx_pair(libctx, TLS_server_method(),
+                TLS_client_method(), resumever, resumever,
+                &sctx2, &cctx2, cert, privkey))
+            || !TEST_true(SSL_CTX_set_session_id_context(sctx2,
+                (void *)&sess_id_ctx, sizeof(sess_id_ctx))))
+            goto end;
+        SSL_CTX_set_session_cache_mode(sctx2, SSL_SESS_CACHE_OFF);
+    } else {
+        sctx2 = sctx;
+        cctx2 = cctx;
+    }
+
+    if (!TEST_true(create_ssl_objects(sctx2, cctx2, &serverssl, &clientssl,
+            NULL, NULL))
+        || !TEST_true(SSL_set_session(clientssl, sess))
+        || !TEST_true(create_ssl_connection(serverssl, clientssl,
+            SSL_ERROR_NONE)))
+        goto end;
+
+    /* The negotiated version must be the configured one - no downgrade */
+    if (!TEST_int_eq(SSL_version(clientssl), resumever)
+        || !TEST_int_eq(SSL_version(serverssl), resumever))
+        goto end;
+
+    if (expectresume) {
+        /* A valid ticket still resumes at its original version */
+        if (!TEST_true(SSL_session_reused(clientssl))
+            || !TEST_true(SSL_session_reused(serverssl)))
+            goto end;
+    } else {
+        /*
+         * An invalid ticket must be rejected with a safe fallback to a
+         * full handshake: no session context is reused on either side.
+         */
+        if (!TEST_false(SSL_session_reused(clientssl))
+            || !TEST_false(SSL_session_reused(serverssl)))
+            goto end;
+    }
+
+    testresult = 1;
+
+end:
+    SSL_SESSION_free(sess);
+    SSL_free(serverssl);
+    SSL_free(clientssl);
+    if (sctx2 != NULL && sctx2 != sctx)
+        SSL_CTX_free(sctx2);
+    if (cctx2 != NULL && cctx2 != cctx)
+        SSL_CTX_free(cctx2);
+    SSL_CTX_free(sctx);
+    SSL_CTX_free(cctx);
+    return testresult;
+}
+
 /* Both PSK binders must remain valid if allocating the second grows the packet. */
 static int test_psk_binder_growth(int idx)
 {
@@ -19724,6 +19871,14 @@ int setup_tests(void)
     ADD_ALL_TESTS(test_psk_tickets, 2);
     ADD_ALL_TESTS(test_extra_tickets, 12);
     ADD_ALL_TESTS(test_psk_binder_growth, 2);
+#endif
+    /*
+     * Cross-version, key-rotation and truncated-ticket cases need TLSv1.2
+     * or TLSv1.3 over TLS; individual cases skip themselves if their
+     * version is unusable.
+     */
+#if !defined(OPENSSL_NO_TLS1_2) || !defined(OSSL_NO_USABLE_TLS1_3)
+    ADD_ALL_TESTS(test_ticket_version_boundary, 8);
 #endif
     ADD_ALL_TESTS(test_ssl_set_bio, TOTAL_SSL_SET_BIO_TESTS);
     ADD_TEST(test_ssl_bio_pop_next_bio);
