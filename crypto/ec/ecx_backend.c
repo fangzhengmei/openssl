@@ -58,6 +58,7 @@ int ossl_ecx_key_fromdata(ECX_KEY *ecx, const OSSL_PARAM *param_pub_key,
 {
     size_t privkeylen = 0, pubkeylen = 0;
     unsigned char *pubkey;
+    int ok = 0;
 
     if (ecx == NULL)
         return 0;
@@ -87,17 +88,31 @@ int ossl_ecx_key_fromdata(ECX_KEY *ecx, const OSSL_PARAM *param_pub_key,
         && !OSSL_PARAM_get_octet_string(param_pub_key,
             (void **)&pubkey,
             sizeof(ecx->pubkey), &pubkeylen))
-        return 0;
+        goto err;
 
     if ((param_pub_key != NULL && pubkeylen != ecx->keylen))
-        return 0;
+        goto err;
 
     if (param_pub_key == NULL && !ossl_ecx_public_from_private(ecx))
-        return 0;
+        goto err;
 
     ecx->haspubkey = 1;
+    ok = 1;
 
-    return 1;
+err:
+    /*
+     * A failure after the private key was installed must not leave a
+     * partially initialised key behind: roll back to the pristine state a
+     * freshly allocated object starts in.  The object is discarded by the
+     * caller on failure regardless, but this guarantees that no private key
+     * material or partial state can be inherited if it is ever reused.
+     */
+    if (!ok) {
+        OPENSSL_secure_clear_free(ecx->privkey, ecx->keylen);
+        ecx->privkey = NULL;
+        ecx->haspubkey = 0;
+    }
+    return ok;
 }
 
 ECX_KEY *ossl_ecx_key_dup(const ECX_KEY *key, int selection)

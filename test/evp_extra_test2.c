@@ -22,6 +22,9 @@
 #include <openssl/provider.h>
 #include <openssl/rsa.h>
 #include <openssl/dh.h>
+#include <openssl/bn.h>
+#include <openssl/params.h>
+#include <openssl/decoder.h>
 #include <openssl/core_names.h>
 #include <openssl/ui.h>
 
@@ -1829,6 +1832,404 @@ static int test_dh_priv_bits(void)
 }
 #endif
 
+/*
+ * Malformed private key import regression tests.
+ *
+ * A malformed private key goes through DER decoding, parameter validation
+ * and provider object conversion (EVP_PKEY_fromdata / the OSSL_DECODER chain).
+ * A failure on any of these paths must release every temporary object, must
+ * not leave state in the shared library context that a later import could
+ * inherit, and must report a stable failure (NULL result, an error on the
+ * queue).  These tests alternate failing and succeeding imports inside one
+ * library context so that a leak or inherited/accumulated state is caught.
+ */
+
+/* Number of alternating fail/success cycles exercised below. */
+#define BAD_IMPORT_REPEATS 8
+
+#ifndef OPENSSL_NO_RSA
+/* Generate an RSA key and its DER (type specific) and PKCS#8 encodings. */
+static int gen_rsa_der(OSSL_LIB_CTX *libctx, EVP_PKEY **pkey,
+    unsigned char **der, long *der_len,
+    unsigned char **p8, long *p8_len)
+{
+    EVP_PKEY_CTX *gctx = NULL;
+    unsigned char *derbuf = NULL, *p8buf = NULL;
+    int dlen, plen = 0;
+    int ok = 0;
+
+    *pkey = NULL;
+    *der = NULL;
+    *p8 = NULL;
+    if (!TEST_ptr(gctx = EVP_PKEY_CTX_new_from_name(libctx, "RSA", NULL))
+        || !TEST_int_gt(EVP_PKEY_keygen_init(gctx), 0)
+        || !TEST_int_gt(EVP_PKEY_keygen(gctx, pkey), 0))
+        goto err;
+    dlen = i2d_PrivateKey(*pkey, &derbuf);
+    if (!TEST_int_gt(dlen, 0))
+        goto err;
+    plen = i2d_PKCS8PrivateKey(*pkey, &p8buf);
+    if (!TEST_int_gt(plen, 0))
+        goto err;
+    *der_len = dlen;
+    *der = derbuf;
+    *p8_len = plen;
+    *p8 = p8buf;
+    derbuf = NULL;
+    p8buf = NULL;
+    ok = 1;
+err:
+    OPENSSL_free(derbuf);
+    OPENSSL_free(p8buf);
+    EVP_PKEY_CTX_free(gctx);
+    return ok;
+}
+
+/* Decode a DER PrivateKeyInfo blob through the public decoder chain. */
+static EVP_PKEY *decode_p8_der(OSSL_LIB_CTX *libctx, const unsigned char *buf,
+    size_t len, const char *keytype)
+{
+    EVP_PKEY *pkey = NULL;
+    OSSL_DECODER_CTX *dctx =
+        OSSL_DECODER_CTX_new_for_pkey(&pkey, "DER", "PrivateKeyInfo",
+            keytype, EVP_PKEY_KEYPAIR, libctx, NULL);
+
+    if (dctx == NULL)
+        return NULL;
+    if (OSSL_DECODER_from_data(dctx, &buf, &len) != 1) {
+        OSSL_DECODER_CTX_free(dctx);
+        return NULL;
+    }
+    OSSL_DECODER_CTX_free(dctx);
+    return pkey;
+}
+
+/*
+ * Feed truncated / illegal-length / garbage DER through both the type
+ * specific d2i entry point and the PKCS#8 decoder chain, then prove that a
+ * subsequent, well-formed key still decodes and is usable in the same
+ * library context.  Repeated cycles make a leak or state accumulation show
+ * up under a memory/UB sanitizer.
+ */
+static int test_malformed_der_import(void)
+{
+    EVP_PKEY *good = NULL, *pkey = NULL;
+    unsigned char *der = NULL, *p8 = NULL;
+    unsigned char *trunc = NULL, *badlen = NULL, *garbage = NULL;
+    long der_len = 0, p8_len = 0;
+    int i, ok = 0;
+
+    if (!gen_rsa_der(mainctx, &good, &der, &der_len, &p8, &p8_len))
+        goto err;
+
+    /* Truncated DER. */
+    if (!TEST_ptr(trunc = OPENSSL_memdup(der, (size_t)der_len - 1)))
+        goto err;
+    /* Illegal declared length: inflate the outer content length. */
+    if (!TEST_ptr(badlen = OPENSSL_memdup(der, (size_t)der_len)))
+        goto err;
+    if (badlen[1] < 0x80)
+        badlen[1] = (unsigned char)(badlen[1] + 20);
+    else if (der_len > 4)
+        badlen[2] = (unsigned char)(badlen[2] + 20);
+    /* Unrelated garbage that has the outer SEQUENCE tag length only. */
+    if (!TEST_ptr(garbage = OPENSSL_malloc(32)))
+        goto err;
+    memset(garbage, 0xab, 32);
+
+    for (i = 0; i < BAD_IMPORT_REPEATS; i++) {
+        const unsigned char *p;
+
+        /* Type specific d2i must reject every malformed blob. */
+        p = trunc;
+        ERR_clear_error();
+        pkey = d2i_PrivateKey_ex(EVP_PKEY_RSA, NULL, &p, der_len - 1,
+            mainctx, NULL);
+        if (!TEST_ptr_null(pkey))
+            goto err;
+        EVP_PKEY_free(pkey);
+
+        p = badlen;
+        ERR_clear_error();
+        pkey = d2i_PrivateKey_ex(EVP_PKEY_RSA, NULL, &p, der_len,
+            mainctx, NULL);
+        if (!TEST_ptr_null(pkey))
+            goto err;
+        EVP_PKEY_free(pkey);
+
+        /* PKCS#8 decoder chain: truncated and garbage. */
+        ERR_clear_error();
+        pkey = decode_p8_der(mainctx, p8, (size_t)(p8_len - 3), "RSA");
+        if (!TEST_ptr_null(pkey) || !TEST_int_ne(ERR_peek_error(), 0))
+            goto err;
+        EVP_PKEY_free(pkey);
+
+        ERR_clear_error();
+        pkey = decode_p8_der(mainctx, garbage, 32, "RSA");
+        if (!TEST_ptr_null(pkey) || !TEST_int_ne(ERR_peek_error(), 0))
+            goto err;
+        EVP_PKEY_free(pkey);
+
+        /*
+         * The well-formed keys must still decode cleanly afterwards and must
+         * not inherit any error state from the failed attempts.
+         */
+        ERR_clear_error();
+        pkey = decode_p8_der(mainctx, p8, (size_t)p8_len, "RSA");
+        if (!TEST_ptr(pkey) || !TEST_int_eq(ERR_peek_error(), 0))
+            goto err;
+        EVP_PKEY_free(pkey);
+
+        p = der;
+        ERR_clear_error();
+        pkey = d2i_PrivateKey_ex(EVP_PKEY_RSA, NULL, &p, der_len,
+            mainctx, NULL);
+        if (!TEST_ptr(pkey) || !TEST_int_eq(ERR_peek_error(), 0))
+            goto err;
+        EVP_PKEY_free(pkey);
+        pkey = NULL;
+    }
+    ok = 1;
+err:
+    EVP_PKEY_free(pkey);
+    EVP_PKEY_free(good);
+    OPENSSL_free(der);
+    OPENSSL_free(p8);
+    OPENSSL_free(trunc);
+    OPENSSL_free(badlen);
+    OPENSSL_free(garbage);
+    return ok;
+}
+
+/*
+ * Parameter level failures through EVP_PKEY_fromdata: a required parameter
+ * missing, and a parameter delivered with the wrong OSSL_PARAM type.  Each
+ * failing attempt is followed on the same context by a successful import
+ * whose key is then exercised, proving nothing leaks or carries over.
+ */
+static int test_fromdata_failure_recovery(void)
+{
+    EVP_PKEY_CTX *ctx = NULL, *gctx = NULL;
+    EVP_PKEY *good = NULL, *pkey = NULL;
+    BIGNUM *n = NULL, *e = NULL, *d = NULL;
+    unsigned char *nb = NULL, *eb = NULL, *db = NULL, *raw = NULL;
+    size_t nsz, esz, dsz;
+    OSSL_PARAM good_params[4], missing_params[2], type_params[3];
+    int i, ok = 0;
+
+    if (!TEST_ptr(gctx = EVP_PKEY_CTX_new_from_name(mainctx, "RSA", NULL))
+        || !TEST_int_gt(EVP_PKEY_keygen_init(gctx), 0)
+        || !TEST_int_gt(EVP_PKEY_keygen(gctx, &good), 0))
+        goto err;
+    if (!TEST_true(EVP_PKEY_get_bn_param(good, OSSL_PKEY_PARAM_RSA_N, &n))
+        || !TEST_true(EVP_PKEY_get_bn_param(good, OSSL_PKEY_PARAM_RSA_E, &e))
+        || !TEST_true(EVP_PKEY_get_bn_param(good, OSSL_PKEY_PARAM_RSA_D, &d)))
+        goto err;
+    nsz = BN_num_bytes(n);
+    esz = BN_num_bytes(e);
+    dsz = BN_num_bytes(d);
+
+    if (!TEST_ptr(ctx = EVP_PKEY_CTX_new_from_name(mainctx, "RSA", NULL))
+        || !TEST_int_eq(EVP_PKEY_fromdata_init(ctx), 1))
+        goto err;
+
+    for (i = 0; i < BAD_IMPORT_REPEATS; i++) {
+        /* Missing mandatory public exponent 'e'. */
+        nb = OPENSSL_malloc(256);
+        if (!TEST_ptr(nb))
+            goto err;
+        BN_bn2nativepad(n, nb, 256);
+        missing_params[0] =
+            OSSL_PARAM_construct_BN(OSSL_PKEY_PARAM_RSA_N, nb, 256);
+        missing_params[0].data_size = nsz;
+        missing_params[1] = OSSL_PARAM_construct_end();
+        pkey = NULL;
+        ERR_clear_error();
+        if (!TEST_int_le(EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_KEYPAIR,
+                               missing_params), 0)
+            || !TEST_ptr_null(pkey)
+            || !TEST_int_ne(ERR_peek_error(), 0)) {
+            OPENSSL_free(nb);
+            goto err;
+        }
+        OPENSSL_free(nb);
+        EVP_PKEY_free(pkey);
+
+        /* Type conflict: modulus 'n' supplied as an octet string. */
+        raw = OPENSSL_malloc(256);
+        eb = OPENSSL_malloc(64);
+        if (!TEST_ptr(raw) || !TEST_ptr(eb)) {
+            OPENSSL_free(raw);
+            OPENSSL_free(eb);
+            goto err;
+        }
+        BN_bn2nativepad(n, raw, 256);
+        BN_bn2nativepad(e, eb, 64);
+        type_params[0] =
+            OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_RSA_N,
+                raw, nsz);
+        type_params[1] =
+            OSSL_PARAM_construct_BN(OSSL_PKEY_PARAM_RSA_E, eb, 64);
+        type_params[1].data_size = esz;
+        type_params[2] = OSSL_PARAM_construct_end();
+        pkey = NULL;
+        ERR_clear_error();
+        if (!TEST_int_le(EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_KEYPAIR,
+                               type_params), 0)
+            || !TEST_ptr_null(pkey)
+            || !TEST_int_ne(ERR_peek_error(), 0)) {
+            OPENSSL_free(raw);
+            OPENSSL_free(eb);
+            goto err;
+        }
+        OPENSSL_free(raw);
+        OPENSSL_free(eb);
+        EVP_PKEY_free(pkey);
+
+        /* Valid import on the same context must still succeed cleanly. */
+        nb = OPENSSL_malloc(256);
+        eb = OPENSSL_malloc(64);
+        db = OPENSSL_malloc(256);
+        if (!TEST_ptr(nb) || !TEST_ptr(eb) || !TEST_ptr(db)) {
+            OPENSSL_free(nb);
+            OPENSSL_free(eb);
+            OPENSSL_free(db);
+            goto err;
+        }
+        BN_bn2nativepad(n, nb, 256);
+        BN_bn2nativepad(e, eb, 64);
+        BN_bn2nativepad(d, db, 256);
+        {
+            int j = 0;
+
+            good_params[j++] =
+                OSSL_PARAM_construct_BN(OSSL_PKEY_PARAM_RSA_N, nb, 256);
+            good_params[j++] =
+                OSSL_PARAM_construct_BN(OSSL_PKEY_PARAM_RSA_E, eb, 64);
+            good_params[j++] =
+                OSSL_PARAM_construct_BN(OSSL_PKEY_PARAM_RSA_D, db, 256);
+            good_params[j] = OSSL_PARAM_construct_end();
+            good_params[0].data_size = nsz;
+            good_params[1].data_size = esz;
+            good_params[2].data_size = dsz;
+        }
+        pkey = NULL;
+        ERR_clear_error();
+        if (!TEST_int_eq(EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_KEYPAIR,
+                               good_params), 1)
+            || !TEST_ptr(pkey)
+            || !TEST_int_eq(ERR_peek_error(), 0)) {
+            OPENSSL_free(nb);
+            OPENSSL_free(eb);
+            OPENSSL_free(db);
+            goto err;
+        }
+        /* The recovered key must be fully usable. */
+        if (!TEST_true(EVP_PKEY_eq(pkey, good))) {
+            OPENSSL_free(nb);
+            OPENSSL_free(eb);
+            OPENSSL_free(db);
+            goto err;
+        }
+        OPENSSL_free(nb);
+        OPENSSL_free(eb);
+        OPENSSL_free(db);
+        EVP_PKEY_free(pkey);
+        pkey = NULL;
+    }
+    ok = 1;
+err:
+    EVP_PKEY_free(pkey);
+    BN_free(n);
+    BN_free(e);
+    BN_free(d);
+    EVP_PKEY_free(good);
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_CTX_free(gctx);
+    return ok;
+}
+#endif /* OPENSSL_NO_RSA */
+
+/*
+ * Raw (octet-string) key types: an illegal length private key must be
+ * rejected and the half-initialised provider object discarded, while a
+ * correctly sized key keeps importing on the same context.
+ */
+#ifndef OPENSSL_NO_ECX
+static int test_raw_key_failure_recovery(void)
+{
+    EVP_PKEY *good = NULL, *pkey = NULL;
+    EVP_PKEY_CTX *gctx = NULL, *ctx = NULL;
+    unsigned char priv[32];
+    size_t privlen = sizeof(priv);
+    OSSL_PARAM good_params[2], short_params[2], long_params[2];
+    unsigned char longbuf[33];
+    int i, ok = 0;
+
+    if (!TEST_ptr(gctx = EVP_PKEY_CTX_new_from_name(mainctx, "ED25519", NULL))
+        || !TEST_int_gt(EVP_PKEY_keygen_init(gctx), 0)
+        || !TEST_int_gt(EVP_PKEY_keygen(gctx, &good), 0))
+        goto err;
+    if (!TEST_true(EVP_PKEY_get_octet_string_param(good,
+            OSSL_PKEY_PARAM_PRIV_KEY, priv, sizeof(priv), &privlen))
+        || !TEST_size_t_eq(privlen, 32))
+        goto err;
+    if (!TEST_ptr(ctx = EVP_PKEY_CTX_new_from_name(mainctx, "ED25519", NULL))
+        || !TEST_int_eq(EVP_PKEY_fromdata_init(ctx), 1))
+        goto err;
+
+    good_params[0] =
+        OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PRIV_KEY,
+            priv, privlen);
+    good_params[1] = OSSL_PARAM_construct_end();
+    short_params[0] =
+        OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PRIV_KEY,
+            priv, 31);
+    short_params[1] = OSSL_PARAM_construct_end();
+    memcpy(longbuf, priv, sizeof(priv));
+    long_params[0] =
+        OSSL_PARAM_construct_octet_string(OSSL_PKEY_PARAM_PRIV_KEY,
+            longbuf, sizeof(longbuf));
+    long_params[1] = OSSL_PARAM_construct_end();
+
+    for (i = 0; i < BAD_IMPORT_REPEATS; i++) {
+        pkey = NULL;
+        ERR_clear_error();
+        if (!TEST_int_le(EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_KEYPAIR,
+                               short_params), 0)
+            || !TEST_ptr_null(pkey))
+            goto err;
+        EVP_PKEY_free(pkey);
+
+        pkey = NULL;
+        ERR_clear_error();
+        if (!TEST_int_le(EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_KEYPAIR,
+                               long_params), 0)
+            || !TEST_ptr_null(pkey))
+            goto err;
+        EVP_PKEY_free(pkey);
+
+        pkey = NULL;
+        ERR_clear_error();
+        if (!TEST_int_eq(EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_KEYPAIR,
+                               good_params), 1)
+            || !TEST_ptr(pkey)
+            || !TEST_int_eq(ERR_peek_error(), 0)
+            || !TEST_true(EVP_PKEY_eq(pkey, good)))
+            goto err;
+        EVP_PKEY_free(pkey);
+        pkey = NULL;
+    }
+    ok = 1;
+err:
+    EVP_PKEY_free(pkey);
+    EVP_PKEY_free(good);
+    EVP_PKEY_CTX_free(ctx);
+    EVP_PKEY_CTX_free(gctx);
+    return ok;
+}
+#endif /* OPENSSL_NO_ECX */
+
 int setup_tests(void)
 {
     if (!test_get_libctx(&mainctx, &nullprov, NULL, NULL, NULL)) {
@@ -1874,6 +2275,13 @@ int setup_tests(void)
     ADD_TEST(test_evp_md_ctx_copy2);
     ADD_ALL_TESTS(test_evp_md_ctx_serialize, 13);
     ADD_ALL_TESTS(test_provider_unload_effective, 2);
+#ifndef OPENSSL_NO_RSA
+    ADD_TEST(test_malformed_der_import);
+    ADD_TEST(test_fromdata_failure_recovery);
+#endif
+#ifndef OPENSSL_NO_ECX
+    ADD_TEST(test_raw_key_failure_recovery);
+#endif
 #if !defined OPENSSL_NO_DES && !defined OPENSSL_NO_MD5
     ADD_TEST(test_evp_pbe_alg_add);
 #endif
